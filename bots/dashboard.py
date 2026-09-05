@@ -524,6 +524,7 @@ def _weekly_rollup(
     lb_floor_pct: float,
     z: float = 1.2816,
     eligible: bool = True,
+    lifetime: tuple[int, int] | None = None,
 ) -> dict:
     """Win counts over the emission window plus an unweighted decay proxy.
 
@@ -531,6 +532,15 @@ def _weekly_rollup(
     /api/status feed and the HF results ledger both qualify). Wins are split
     into raw and gate-qualified, the latter re-deriving the qualify gate AS OF
     each win the way scoring.qualified_wins does.
+
+    `lifetime` is IQ's (won, lost) totals. The call feed is PAGED — LF returns
+    ~25 rows and HF is capped — so it routinely covers days where the gate reads
+    60. Reconstructing from the feed alone restarts the miner's record from zero
+    and reports a long-qualified miner as unqualified, so whatever IQ counts but
+    the feed does not show is folded back in as a bulk seed on the trailing
+    window. Exact when the career fits inside the reputation window; an
+    overcount for a career older than it, which is why anything seeded is
+    flagged approximate.
     """
     decisive: list[tuple[float, bool]] = []
     washed = 0
@@ -556,15 +566,30 @@ def _weekly_rollup(
     # capped at the most recent hit_rate_window_trades_as_of(t0) outcomes. The
     # live gate is CONFIDENCE_SCORING — sample floor plus Wilson LB, with no
     # raw-hit term — so only those two conditions are applied.
+    # Outcomes IQ has graded that this page of the feed never showed us.
+    seed_wins = seed_decisive = 0
+    if lifetime:
+        lt_won, lt_lost = lifetime
+        seed_wins = max(0, int(lt_won) - sum(1 for _, w in decisive if w))
+        seed_decisive = max(0, (int(lt_won) + int(lt_lost)) - len(decisive))
+        seed_wins = min(seed_wins, seed_decisive)
+
     qualified: list[float] = []
     for i, (t0, won) in enumerate(decisive):
         if not won or not _live(t0):
             continue
         cut = t0 - sn_config.HIT_RATE_WINDOW_S
-        window = [d for d in decisive[:i + 1] if d[0] >= cut][
-            -sn_config.hit_rate_window_trades_as_of(t0):]
+        cap = sn_config.hit_rate_window_trades_as_of(t0)
+        window = [d for d in decisive[:i + 1] if d[0] >= cut][-cap:]
         rep_wins = sum(1 for _, w in window if w)
         rep_decisive = len(window)
+        # The unseen remainder is older than everything in the feed, so it fills
+        # what the trade cap leaves over after the rows we can actually see.
+        if seed_decisive:
+            used = min(seed_decisive, max(0, cap - rep_decisive))
+            if used:
+                rep_wins += int(round(seed_wins * used / seed_decisive))
+                rep_decisive += used
         if rep_decisive >= min_decisive and _wilson_lb_pct(rep_wins, rep_decisive, z) >= lb_floor_pct:
             qualified.append(t0)
 
@@ -577,7 +602,10 @@ def _weekly_rollup(
     # reach that far back before the oldest scored win — a truncated ledger, or
     # simply a short career, which look identical from here — the sample is
     # short and qualified wins can be undercounted.
-    approx = bool(live_wins) and decisive[0][0] > min(live_wins) - sn_config.HIT_RATE_WINDOW_S
+    approx = bool(live_wins) and (
+        bool(seed_decisive)
+        or decisive[0][0] > min(live_wins) - sn_config.HIT_RATE_WINDOW_S
+    )
 
     return {
         "window_days": round(decay_s / 86_400.0, 2),
@@ -777,6 +805,7 @@ def run_status() -> dict:
         win_cap=sn_config.WIN_CAP,
         min_decisive=int(iq_config.get("qualify_min_decisive") or 8),
         lb_floor_pct=float(iq_config.get("qualify_lb_floor_pct") or 50.0),
+        lifetime=(int(miner.get("won") or 0), int(miner.get("lost") or 0)) if miner else None,
     )
 
     return {
@@ -986,6 +1015,7 @@ def run_hf_results(tag: str = DEFAULT_HF_TAG) -> dict:
         # Nothing earns before the HF eligibility gate opens, however the
         # confidence gate reads.
         eligible=bool(hf.get("eligible")),
+        lifetime=(int(hf.get("won") or 0), int(hf.get("lost") or 0)),
     )
     return {
         "ok": True,
@@ -2296,7 +2326,7 @@ function renderWeek(panelId, badgeId, bodyId, w) {
     notes.push(`Win cap binding: ${w.won} live wins, only the most recent ${w.win_cap} count.`);
   }
   if (w.qualified_approx) {
-    notes.push('<b>~</b> approximate: the ledger does not reach back a full reputation window, so the as-of gate reads a short sample and may undercount.');
+    notes.push('<b>~</b> approximate: the call feed is paged and does not reach back a full reputation window, so the as-of gate is reconstructed with your IQ win/loss totals folded in as an older-history seed.');
   }
   notes.push(`Decay-weighted is an <b>unweighted proxy</b> — same curve and window as the validator's tally, but without the per-win tier and wash-efficiency multipliers, which the call feed does not carry. It is also a numerator: your actual share is this normalized across the field.`);
 

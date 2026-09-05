@@ -136,6 +136,57 @@ class TestQualification:
         assert w["qualified_won"] == len(qwins)
 
 
+class TestLifetimeSeed:
+    """The feed is paged (LF returns ~25 rows against a 60-day gate), so without
+    the seed a long-qualified miner reconstructs from zero and reports as
+    unqualified. These pin the regression that caused."""
+
+    def test_paged_feed_alone_undercounts_a_qualified_miner(self):
+        # 8W/6L visible, but IQ has graded 26W/16L — LB 52%, comfortably passing
+        visible = [call(i * 0.4, "won" if i % 7 < 4 else "lost") for i in range(14)]
+        assert roll(visible)["qualified_won"] == 0
+
+    def test_seed_recovers_the_real_gate_verdict(self):
+        visible = [call(i * 0.4, "won" if i % 7 < 4 else "lost") for i in range(14)]
+        w = _weekly_rollup(
+            visible, NOW,
+            decay_s=WEEK, win_cap=config.WIN_CAP,
+            min_decisive=8, lb_floor_pct=50.0, lifetime=(26, 16),
+        )
+        assert w["qualified_won"] > 0
+        assert w["qualified_approx"] is True
+
+    def test_seed_cannot_rescue_a_genuinely_bad_record(self):
+        visible = [call(i * 0.4, "won" if i % 2 else "lost") for i in range(14)]
+        w = _weekly_rollup(
+            visible, NOW,
+            decay_s=WEEK, win_cap=config.WIN_CAP,
+            min_decisive=8, lb_floor_pct=50.0, lifetime=(20, 40),
+        )
+        assert w["qualified_won"] == 0
+
+    def test_seed_ignored_when_the_feed_already_holds_everything(self):
+        calls = clean_record(20)
+        seeded = _weekly_rollup(
+            calls, NOW, decay_s=WEEK, win_cap=config.WIN_CAP,
+            min_decisive=8, lb_floor_pct=50.0, lifetime=(20, 0),
+        )
+        assert seeded["qualified_won"] == roll(calls)["qualified_won"]
+
+    def test_seed_never_goes_negative_on_a_stale_lifetime(self):
+        # IQ totals can lag the feed; that must not produce a negative sample
+        w = _weekly_rollup(
+            clean_record(20), NOW, decay_s=WEEK, win_cap=config.WIN_CAP,
+            min_decisive=8, lb_floor_pct=50.0, lifetime=(2, 1),
+        )
+        assert w["qualified_won"] >= 0
+
+    def test_wilson_matches_iq_confidence_lb(self):
+        """26W/42 decisive is the live LF record; IQ reports 52.03% for it."""
+        from bots.dashboard import _wilson_lb_pct
+        assert _wilson_lb_pct(26, 42, 1.2816) == pytest.approx(52.03, abs=0.05)
+
+
 class TestEligibility:
     def test_ineligible_miner_earns_nothing(self):
         w = roll(clean_record(20), eligible=False)

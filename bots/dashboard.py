@@ -498,7 +498,11 @@ def _gate_pass(
     }
 
 
-# ── rolling-week earning view ────────────────────────────────────────────────
+# ── trailing-window earning view ─────────────────────────────────────────────
+# Everything below is measured BACKWARD FROM `now`, not from a calendar or UTC
+# boundary: a win leaves the window exactly EMISSION_DECAY_S after its own t0.
+# The quota timers elsewhere on the panel do reset at UTC midnight, so the UI
+# says "Past N days" rather than "this week" to keep the two apart.
 # The scoreline above the panel is LIFETIME, but emission is sized by a tally
 # that decays to zero over exactly one week (config.EMISSION_DECAY_S on LF,
 # hf.HF_EMISSION_DECAY_S on HF — both 7d since 2026-07-31). A miner whose last
@@ -1388,7 +1392,7 @@ tailwind.config = {
 
     <section class="desk-panel p-5" id="weekPanel" style="display:none">
       <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
-        <h2 class="desk-panel-head mb-0">This week · emission window</h2>
+        <h2 class="desk-panel-head mb-0">Past 7 days · emission window</h2>
         <span class="desk-chip" id="weekBadge">—</span>
       </div>
       <div id="weekBody" class="text-sm text-zinc-500">—</div>
@@ -1570,7 +1574,7 @@ tailwind.config = {
 
     <section class="desk-panel p-5" id="hfWeekPanel" style="display:none">
       <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
-        <h2 class="desk-panel-head mb-0">This week · emission window</h2>
+        <h2 class="desk-panel-head mb-0">Past 7 days · emission window</h2>
         <span class="desk-chip" id="hfWeekBadge">—</span>
       </div>
       <div id="hfWeekBody" class="text-sm text-zinc-500">—</div>
@@ -2291,7 +2295,14 @@ function renderWeek(panelId, badgeId, bodyId, w) {
 
   const approx = w.qualified_approx ? '~' : '';
   const stale = w.won === 0;
-  $(badgeId).textContent = `${w.window_days}d window`;
+
+  // Track the constant rather than hardcoding 7 — SN89_EMISSION_DECAY_S and
+  // SN89_HF_EMISSION_DECAY_S can both be overridden, and a heading that lies
+  // about the window is worse than no heading.
+  const head = panel.querySelector('h2');
+  if (head) head.textContent = `Past ${w.window_days} days · emission window`;
+
+  $(badgeId).textContent = stale ? 'no live wins' : 'rolling';
   $(badgeId).className = stale
     ? 'desk-chip border-amber-500/40 text-amber-200 bg-amber-500/10'
     : 'desk-chip border-emerald-500/40 text-emerald-300 bg-emerald-500/10';
@@ -2320,7 +2331,7 @@ function renderWeek(panelId, badgeId, bodyId, w) {
     notes.push('<span class="text-amber-300">Not eligible yet — no win earns until the gate opens.</span>');
   }
   if (stale) {
-    notes.push(`<span class="text-amber-300">No wins inside the ${w.window_days}d window — the decayed tally behind your weight is zero regardless of lifetime record.</span>`);
+    notes.push(`<span class="text-amber-300">No wins in the last ${w.window_days} days — the decayed tally behind your weight is zero regardless of lifetime record.</span>`);
   }
   if (w.cap_binding) {
     notes.push(`Win cap binding: ${w.won} live wins, only the most recent ${w.win_cap} count.`);
@@ -2328,6 +2339,7 @@ function renderWeek(panelId, badgeId, bodyId, w) {
   if (w.qualified_approx) {
     notes.push('<b>~</b> approximate: the call feed is paged and does not reach back a full reputation window, so the as-of gate is reconstructed with your IQ win/loss totals folded in as an older-history seed.');
   }
+  notes.push(`Rolling from right now, <b>not a calendar week</b> — nothing resets at UTC midnight here, each win simply drops out ${w.window_days * 24}h after it was posted.`);
   notes.push(`Decay-weighted is an <b>unweighted proxy</b> — same curve and window as the validator's tally, but without the per-win tier and wash-efficiency multipliers, which the call feed does not carry. It is also a numerator: your actual share is this normalized across the field.`);
 
   $(bodyId).innerHTML = `

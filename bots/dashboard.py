@@ -43,6 +43,10 @@ sys.path.insert(0, str(BOT_DIR))
 import ai_finance_bot as bot  # noqa: E402
 import hf_auto_bot as hfbot  # noqa: E402
 
+# hf_auto_bot puts the repo root on sys.path; import the validator's own
+# constants rather than restating the emission window and caps here.
+from sn89_signals import config as sn_config  # noqa: E402
+
 # The original (only) HF miner slot — kept as the default so old bookmarked
 # tabs / a stale frontend cache without ?miner= still resolve to something.
 DEFAULT_HF_TAG = "sn89-1"
@@ -494,6 +498,103 @@ def _gate_pass(
     }
 
 
+# ── rolling-week earning view ────────────────────────────────────────────────
+# The scoreline above the panel is LIFETIME, but emission is sized by a tally
+# that decays to zero over exactly one week (config.EMISSION_DECAY_S on LF,
+# hf.HF_EMISSION_DECAY_S on HF — both 7d since 2026-07-31). A miner whose last
+# win is eight days old reads healthy on the lifetime line while contributing
+# nothing to the vector, so the panel needs the window the validator pays on.
+#
+# This is deliberately NOT scoring.decayed_qwin_tally, and must not be labelled
+# as it. That function weights every win by the tier AND wash-efficiency it held
+# at its own t0, and neither input exists in the call feed. What is honestly
+# reproducible here is the unweighted SHAPE: each win counts 1.0 and decays
+# linearly across the same window under the same WIN_CAP. Same curve and same
+# horizon, minus the per-win multiplier.
+#
+# The count is also only a numerator — compute_weights normalizes across the
+# field, so this rises and falls with the rest of the field's activity too.
+def _weekly_rollup(
+    calls: list[dict],
+    now: float,
+    *,
+    decay_s: int,
+    win_cap: int,
+    min_decisive: int,
+    lb_floor_pct: float,
+    z: float = 1.2816,
+    eligible: bool = True,
+) -> dict:
+    """Win counts over the emission window plus an unweighted decay proxy.
+
+    `calls` is any per-call ledger carrying `t0_unix` and `status` (the LF
+    /api/status feed and the HF results ledger both qualify). Wins are split
+    into raw and gate-qualified, the latter re-deriving the qualify gate AS OF
+    each win the way scoring.qualified_wins does.
+    """
+    decisive: list[tuple[float, bool]] = []
+    washed = 0
+    for c in calls:
+        t0 = float(c.get("t0_unix") or 0)
+        st = str(c.get("status") or "").lower()
+        if not t0:
+            continue
+        if st in ("won", "lost"):
+            decisive.append((t0, st == "won"))
+        elif st == "washed" and 0.0 <= now - t0 < decay_s:
+            washed += 1
+    decisive.sort(key=lambda d: d[0])
+
+    def _live(t0: float) -> bool:
+        return 0.0 <= now - t0 < decay_s
+
+    live_wins = [t0 for t0, won in decisive if won and _live(t0)]
+    lost = sum(1 for t0, won in decisive if not won and _live(t0))
+
+    # Qualification AS OF each win, mirroring scoring.qualified_wins: the
+    # trailing HIT_RATE_WINDOW_S ending at that win (the win itself included),
+    # capped at the most recent hit_rate_window_trades_as_of(t0) outcomes. The
+    # live gate is CONFIDENCE_SCORING — sample floor plus Wilson LB, with no
+    # raw-hit term — so only those two conditions are applied.
+    qualified: list[float] = []
+    for i, (t0, won) in enumerate(decisive):
+        if not won or not _live(t0):
+            continue
+        cut = t0 - sn_config.HIT_RATE_WINDOW_S
+        window = [d for d in decisive[:i + 1] if d[0] >= cut][
+            -sn_config.hit_rate_window_trades_as_of(t0):]
+        rep_wins = sum(1 for _, w in window if w)
+        rep_decisive = len(window)
+        if rep_decisive >= min_decisive and _wilson_lb_pct(rep_wins, rep_decisive, z) >= lb_floor_pct:
+            qualified.append(t0)
+
+    def _decay_sum(stamps: list[float]) -> float:
+        # Most recent first, then WIN_CAP-truncated, exactly as the tally does.
+        newest = sorted(stamps, reverse=True)[:win_cap]
+        return round(sum(1.0 - (now - t0) / decay_s for t0 in newest), 3)
+
+    # The as-of gate reads a trailing reputation window. When the feed does not
+    # reach that far back before the oldest scored win — a truncated ledger, or
+    # simply a short career, which look identical from here — the sample is
+    # short and qualified wins can be undercounted.
+    approx = bool(live_wins) and decisive[0][0] > min(live_wins) - sn_config.HIT_RATE_WINDOW_S
+
+    return {
+        "window_days": round(decay_s / 86_400.0, 2),
+        "won": len(live_wins),
+        "lost": lost,
+        "washed": washed,
+        "qualified_won": len(qualified) if eligible else 0,
+        "decay_sum": _decay_sum(live_wins),
+        "decay_sum_qualified": _decay_sum(qualified) if eligible else 0.0,
+        "win_cap": win_cap,
+        "cap_binding": len(live_wins) > win_cap,
+        "newest_win_age_h": round((now - max(live_wins)) / 3600.0, 1) if live_wins else None,
+        "qualified_approx": approx,
+        "eligible": bool(eligible),
+    }
+
+
 def _build_qualify_path(
     miner: dict,
     config: dict,
@@ -669,6 +770,15 @@ def run_status() -> dict:
                 "dist_tp_bps": row.get("dist_tp_bps"),
             })
 
+    week = _weekly_rollup(
+        calls,
+        now,
+        decay_s=sn_config.EMISSION_DECAY_S,
+        win_cap=sn_config.WIN_CAP,
+        min_decisive=int(iq_config.get("qualify_min_decisive") or 8),
+        lb_floor_pct=float(iq_config.get("qualify_lb_floor_pct") or 50.0),
+    )
+
     return {
         "ok": True,
         "utc_now": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -708,6 +818,9 @@ def run_status() -> dict:
             "status": miner.get("status"),
         } if miner else None,
         "qualify_path": qualify_path,
+        # Withheld when IQ is unreachable: an empty call feed and a genuinely
+        # winless week are the same zeros, and only one of them is true.
+        "week": week if miner else None,
         "open_call": open_call,
         "calls": calls,
         "iq_ok": bool(miner),
@@ -860,10 +973,25 @@ def run_hf_results(tag: str = DEFAULT_HF_TAG) -> dict:
     gate = hf.get("gate") or {}
     diversity = gate.get("diversity") or {}
     pace = hf.get("pace") or {}
+    # Roll the week up over the FULL ledger, not the 300-row display slice, so
+    # the as-of qualify gate reads as much trailing history as IQ will give us.
+    hf_calls = sorted(hf.get("calls") or [], key=lambda c: c.get("t0_unix") or 0, reverse=True)
+    week = _weekly_rollup(
+        hf_calls,
+        bot.time.time(),
+        decay_s=hfbot.hf.HF_EMISSION_DECAY_S,
+        win_cap=hfbot.hf.HF_WIN_CAP,
+        min_decisive=hfbot.hf.HF_QUALIFY_MIN_DECISIVE,
+        lb_floor_pct=hfbot.hf.HF_QUALIFY_LB_FLOOR * 100.0,
+        # Nothing earns before the HF eligibility gate opens, however the
+        # confidence gate reads.
+        eligible=bool(hf.get("eligible")),
+    )
     return {
         "ok": True,
         "tag": tag,
         "hotkey": hotkey,
+        "week": week,
         "snapshot_at": hf.get("snapshot_at"),
         "status": hf.get("status"),
         "qualified": bool(hf.get("qualified")),
@@ -921,9 +1049,7 @@ def run_hf_results(tag: str = DEFAULT_HF_TAG) -> dict:
         # /api/hf/status's open_positions which is this bot's own local
         # receipts + live mark price. Newest first; capped defensively since
         # the eligibility gate alone already bounds daily volume at 30/day.
-        "calls": _enrich_hf_ledger_calls(
-            sorted(hf.get("calls") or [], key=lambda c: c.get("t0_unix") or 0, reverse=True)[:300]
-        ),
+        "calls": _enrich_hf_ledger_calls(hf_calls[:300]),
     }
 
 
@@ -1230,6 +1356,14 @@ tailwind.config = {
       <span class="text-zinc-500 text-sm">Results loading…</span>
     </div>
 
+    <section class="desk-panel p-5" id="weekPanel" style="display:none">
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 class="desk-panel-head mb-0">This week · emission window</h2>
+        <span class="desk-chip" id="weekBadge">—</span>
+      </div>
+      <div id="weekBody" class="text-sm text-zinc-500">—</div>
+    </section>
+
     <section class="desk-panel p-5" id="qualifyPanel">
       <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
         <h2 class="desk-panel-head mb-0">Path to qualify</h2>
@@ -1403,6 +1537,14 @@ tailwind.config = {
         <div class="text-xs font-mono mt-2 text-zinc-300" id="hfTMoveLine" style="display:none"></div>
       </div>
     </div>
+
+    <section class="desk-panel p-5" id="hfWeekPanel" style="display:none">
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 class="desk-panel-head mb-0">This week · emission window</h2>
+        <span class="desk-chip" id="hfWeekBadge">—</span>
+      </div>
+      <div id="hfWeekBody" class="text-sm text-zinc-500">—</div>
+    </section>
 
     <section class="desk-panel p-5" id="hfResultsPanel">
       <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -2102,6 +2244,67 @@ function gateCheck(ok, label, detail) {
   </div>`;
 }
 
+// One week IS the whole emission horizon on both mechanisms, so this block —
+// not the lifetime scoreline above it — is the window today's weight is sized
+// from. A win that ages past the window contributes exactly zero.
+//
+// "Decay-weighted" here is an UNWEIGHTED proxy: same linear curve, same window,
+// same win cap as the validator's tally, but every win counts 1.0 because the
+// per-win tier and wash-efficiency multipliers are not in the call feed. It
+// tracks the shape of the real number, not its level — and the real number is
+// then normalized across the field, so it is a numerator either way.
+function renderWeek(panelId, badgeId, bodyId, w) {
+  const panel = $(panelId);
+  if (!panel) return;
+  if (!w) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+
+  const approx = w.qualified_approx ? '~' : '';
+  const stale = w.won === 0;
+  $(badgeId).textContent = `${w.window_days}d window`;
+  $(badgeId).className = stale
+    ? 'desk-chip border-amber-500/40 text-amber-200 bg-amber-500/10'
+    : 'desk-chip border-emerald-500/40 text-emerald-300 bg-emerald-500/10';
+
+  const tile = (label, value, cls, title) => `<div class="rounded-xl border border-zinc-800/60 px-3 py-2.5" ${title ? `title="${title}"` : ''}>
+    <div class="text-[10px] font-bold uppercase tracking-wider text-zinc-500">${label}</div>
+    <div class="font-mono text-lg mt-1 ${cls || 'text-zinc-200'}">${value}</div>
+  </div>`;
+
+  const tiles = [
+    tile('Wins', w.won, w.won > 0 ? 'text-emerald-300' : 'text-zinc-500'),
+    tile('Qualified', `${approx}${w.qualified_won}`,
+      w.qualified_won > 0 ? 'text-emerald-300' : 'text-amber-300',
+      'Wins that passed the qualify gate as of their own t0 — only these earn'),
+    tile('Decay-weighted', w.decay_sum_qualified.toFixed(2),
+      w.decay_sum_qualified > 0 ? 'text-emerald-300' : 'text-zinc-500',
+      `Unweighted proxy: sum of (1 - age/${w.window_days}d) over qualified wins. All wins: ${w.decay_sum.toFixed(2)}`),
+    tile('Losses', w.lost, w.lost > 0 ? 'text-rose-300' : 'text-zinc-500'),
+    tile('Wash', w.washed, 'text-zinc-400'),
+    tile('Newest win', w.newest_win_age_h != null ? `${w.newest_win_age_h}h ago` : '—',
+      w.newest_win_age_h != null ? 'text-zinc-300' : 'text-zinc-500'),
+  ].join('');
+
+  const notes = [];
+  if (!w.eligible) {
+    notes.push('<span class="text-amber-300">Not eligible yet — no win earns until the gate opens.</span>');
+  }
+  if (stale) {
+    notes.push(`<span class="text-amber-300">No wins inside the ${w.window_days}d window — the decayed tally behind your weight is zero regardless of lifetime record.</span>`);
+  }
+  if (w.cap_binding) {
+    notes.push(`Win cap binding: ${w.won} live wins, only the most recent ${w.win_cap} count.`);
+  }
+  if (w.qualified_approx) {
+    notes.push('<b>~</b> approximate: the ledger does not reach back a full reputation window, so the as-of gate reads a short sample and may undercount.');
+  }
+  notes.push(`Decay-weighted is an <b>unweighted proxy</b> — same curve and window as the validator's tally, but without the per-win tier and wash-efficiency multipliers, which the call feed does not carry. It is also a numerator: your actual share is this normalized across the field.`);
+
+  $(bodyId).innerHTML = `
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">${tiles}</div>
+    <p class="text-[11px] text-zinc-500 mt-3 leading-relaxed">${notes.join('<br>')}</p>`;
+}
+
 function renderQualifyPath(qp) {
   if (!qp) {
     $('qualifyBadge').textContent = 'IQ API unavailable';
@@ -2229,6 +2432,8 @@ function renderStatus(data) {
     <span class="desk-chip"><b class="font-mono">${sc.pending ?? 0}</b> pending</span>
     <span class="desk-chip text-zinc-500">hit ${hit} · ${sc.lifetime_decisive ?? '—'} decisive · ${sc.status || '—'}${sc.meets_gate ? ' · qualified' : ''}</span>
     <span class="desk-chip ${data.submit_allowed ? 'border-emerald-500/30 text-emerald-300' : 'border-rose-500/30 text-rose-300'}">${data.submit_allowed ? 'submit open' : 'submit blocked'}</span>`;
+
+  renderWeek('weekPanel', 'weekBadge', 'weekBody', data.week);
 
   renderQualifyPath(data.qualify_path);
 
@@ -3107,9 +3312,12 @@ function renderHfResults(data) {
     $('hfResultsQualBadge').textContent = '—';
     $('hfResultsQualBadge').className = 'desk-chip border-zinc-700 text-zinc-500';
     $('hfResultsBody').innerHTML = `<span class="text-zinc-500">${(data && data.error) || 'Could not load HF results from the IQ API.'}</span>`;
+    renderWeek('hfWeekPanel', 'hfWeekBadge', 'hfWeekBody', null);
     renderHfCalls([]);
     return;
   }
+
+  renderWeek('hfWeekPanel', 'hfWeekBadge', 'hfWeekBody', data.week);
 
   $('hfResultsStatusBadge').textContent = data.status || '—';
   $('hfResultsStatusBadge').className = data.status === 'active'
